@@ -1,10 +1,13 @@
 // server/server.js
 const WebSocket = require('ws');
 
-// A porta será definida pelo ambiente de hospedagem (Render)
 const PORT = process.env.PORT || 8080;
 
-const wss = new WebSocket.Server({ port: PORT }, () => {
+// Cria o servidor WebSocket sem o callback no construtor
+const wss = new WebSocket.Server({ port: PORT });
+
+// Adiciona o evento 'listening' para logar quando o servidor estiver pronto
+wss.on('listening', () => {
     console.log(`Servidor de Sinalização iniciado na porta ${PORT}`);
 });
 
@@ -43,13 +46,17 @@ wss.on('connection', ws => {
     }
 
     ws.on('message', message => {
-        const data = JSON.parse(message);
-        console.log(`Mensagem de ${ws.id}:`, data.type);
+        try {
+            const data = JSON.parse(message); // Protegido por try/catch
+            console.log(`Mensagem de ${ws.id}:`, data.type);
 
-        if (ws.peer && ws.peer.readyState === WebSocket.OPEN) {
-            ws.peer.send(JSON.stringify(data));
-        } else {
-            console.log(`Peer de ${ws.id} não está conectado ou pronto. Mensagem "${data.type}" não entregue.`);
+            if (ws.peer && ws.peer.readyState === WebSocket.OPEN) {
+                ws.peer.send(JSON.stringify(data));
+            } else {
+                console.log(`Peer de ${ws.id} não está conectado ou pronto. Mensagem "${data.type}" não entregue.`);
+            }
+        } catch (err) {
+            console.error(`Erro ao processar mensagem JSON de ${ws.id}:`, err);
         }
     });
 
