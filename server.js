@@ -18,13 +18,11 @@ wss.on('connection', ws => {
     clients.set(id, ws);
     console.log(`Novo cliente conectado: ${id}. Total de clientes: ${clients.size}`);
 
-    // Função auxiliar para encontrar e parear um peer
     function findAndPairPeer(currentWs) {
         let peerId = null;
         let peerWs = null;
 
         for (const [otherId, otherWs] of clients.entries()) {
-            // Procura por outro cliente que não seja o próprio, não tenha um peer e esteja aberto
             if (otherId !== currentWs.id && !otherWs.peer && otherWs.readyState === WebSocket.OPEN) {
                 peerId = otherId;
                 peerWs = otherWs;
@@ -34,18 +32,17 @@ wss.on('connection', ws => {
 
         if (peerId !== null) {
             currentWs.peer = peerWs;
-            peerWs.peer = currentWs; // Conecta o peer de volta
+            peerWs.peer = currentWs;
 
             console.log(`Pareando cliente ${currentWs.id} com cliente ${peerId}`);
 
             currentWs.send(JSON.stringify({ type: 'start_call', ownId: currentWs.id, peerId: peerId }));
             peerWs.send(JSON.stringify({ type: 'start_call', ownId: peerId, peerId: currentWs.id }));
-            return true; // Retorna true se encontrou e pareou
+            return true;
         }
-        return false; // Retorna false se não encontrou um par
+        return false;
     }
 
-    // Tenta parear o novo cliente imediatamente
     if (!findAndPairPeer(ws)) {
         console.log(`Cliente ${id} aguardando por um par.`);
         ws.send(JSON.stringify({ type: 'waiting' }));
@@ -59,19 +56,28 @@ wss.on('connection', ws => {
             switch (data.type) {
                 case 'request_new_peer':
                     console.log(`Cliente ${ws.id} solicitou novo peer.`);
-                    // Desconecta do peer atual (se existir)
                     if (ws.peer) {
                         if (ws.peer.readyState === WebSocket.OPEN) {
                             ws.peer.send(JSON.stringify({ type: 'call_ended' }));
-                            ws.peer.peer = null; // Desassocia o peer do cliente restante
+                            ws.peer.peer = null;
                         }
-                        ws.peer = null; // Remove o peer deste cliente
+                        ws.peer = null;
                     }
                     
-                    // Tenta encontrar um novo par para este cliente
                     if (!findAndPairPeer(ws)) {
                         console.log(`Cliente ${ws.id} agora aguardando por um novo par.`);
                         ws.send(JSON.stringify({ type: 'waiting' }));
+                    }
+                    break;
+                case 'report_user': // NOVO: Lidar com a denúncia
+                    console.warn(`DENÚNCIA RECEBIDA: Cliente ${ws.id} denunciou cliente ${data.reportedPeerId || 'desconhecido'}. Motivo: ${data.reason || 'Não especificado'}`);
+                    // Em um app real, aqui você faria:
+                    // 1. Salvar no banco de dados
+                    // 2. Notificar moderadores
+                    // 3. Potencialmente desconectar os usuários ou banir
+                    // Por agora, apenas logamos no console do servidor.
+                    if (ws.peer && ws.peer.readyState === WebSocket.OPEN) {
+                        ws.peer.send(JSON.stringify({ type: 'report_received' })); // Opcional: avisar o outro lado
                     }
                     break;
                 default: // Mensagens WebRTC comuns (offer, answer, candidate)
