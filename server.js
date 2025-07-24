@@ -1,135 +1,109 @@
 // server/server.js
-const http = require('http'); // Módulo HTTP do Node.js
-const WebSocket = require('ws'); // Biblioteca WebSocket
+const http = require('http');
+const WebSocket = require('ws');
 
-const PORT = process.env.PORT || 8080; // Porta do ambiente de hospedagem
+const PORT = process.env.PORT || 8080;
 
-// Cria um servidor HTTP
+// Cria um servidor HTTP para responder a health checks de plataformas como o Render.
 const server = http.createServer((req, res) => {
-    // Responde a requisições HTTP normais (ex: health checks do Render)
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Servidor de Sinalização LinkYou está rodando.');
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Servidor de Sinalização LinkYou está a postos.');
 });
 
-// Cria um servidor WebSocket e o anexa ao servidor HTTP
-const wss = new WebSocket.Server({ server: server });
+// Anexa o servidor WebSocket ao servidor HTTP.
+const wss = new WebSocket.Server({ server });
 
-// Evento de "listening" para quando o servidor estiver pronto
-wss.on('listening', () => {
-    console.log(`Servidor de Sinalização LinkYou iniciado na porta ${PORT}`);
-});
+// Armazenamento em memória para clientes.
+// Em produção, isto seria substituído por uma solução mais robusta como Redis.
+let waitingPeer = null; // Armazena um único cliente que está à espera de um par.
 
-// Armazenamento em memória para clientes (para protótipo)
-const clients = new Map();
-let nextClientId = 0;
+console.log(`Servidor de Sinalização iniciado na porta ${PORT}`);
 
-// Lógica de Conexão WebSocket
 wss.on('connection', ws => {
-    const id = nextClientId++;
-    ws.id = id;
-    clients.set(id, ws);
-    console.log(`Novo cliente conectado: ${id}. Total de clientes: ${clients.size}`);
+  console.log('[CONEXÃO] Novo cliente conectado.');
 
-    // Função auxiliar para encontrar e parear um peer
-    function findAndPairPeer(currentWs) {
-        let peerId = null;
-        let peerWs = null;
-
-        for (const [otherId, otherWs] of clients.entries()) {
-            // Procura por outro cliente que não seja o próprio, não tenha um peer e esteja aberto
-            if (otherId !== currentWs.id && !otherWs.peer && otherWs.readyState === WebSocket.OPEN) {
-                peerId = otherId;
-                peerWs = otherWs;
-                break;
-            }
-        }
-
-        if (peerId !== null) {
-            currentWs.peer = peerWs;
-            peerWs.peer = currentWs; // Conecta o peer de volta
-
-            console.log(`Pareando cliente ${currentWs.id} com cliente ${peerId}`);
-
-            currentWs.send(JSON.stringify({ type: 'start_call', ownId: currentWs.id, peerId: peerId }));
-            peerWs.send(JSON.stringify({ type: 'start_call', ownId: peerId, peerId: currentWs.id }));
-            return true; // Retorna true se encontrou e pareou
-        }
-        return false; // Retorna false se não encontrou um par
+  // Lógica de tratamento de mensagens.
+  ws.on('message', message => {
+    let data;
+    try {
+      data = JSON.parse(message);
+    } catch (e) {
+      console.error('[ERRO] Mensagem inválida (não é JSON):', message);
+      return;
     }
 
-    // Tenta parear o novo cliente imediatamente
-    if (!findAndPairPeer(ws)) {
-        console.log(`Cliente ${id} aguardando por um par.`);
-        ws.send(JSON.stringify({ type: 'waiting' }));
+    console.log(`[MENSAGEM] Recebida de um cliente: ${data.type}`);
+
+    switch (data.type) {
+      // Quando um cliente clica em "Iniciar"
+      case 'request_new_peer':
+        // Limpa qualquer par antigo que este cliente possa ter.
+        if (ws.peer) {
+          ws.peer.peer = null;
+          ws.peer = null;
+        }
+        
+        // Se já houver alguém à espera...
+        if (waitingPeer) {
+          console.log('[PAREAMENTO] Encontrado um par. Iniciando chamada.');
+          const peer = waitingPeer;
+          waitingPeer = null; // Limpa a fila de espera.
+
+          // Liga os dois clientes um ao outro.
+          ws.peer = peer;
+          peer.peer = ws;
+
+          // Envia a mensagem 'start_call' para ambos.
+          // O primeiro a ser pareado (peer) será o iniciador.
+          peer.send(JSON.stringify({ type: 'start_call', isInitiator: true }));
+          ws.send(JSON.stringify({ type: 'start_call', isInitiator: false }));
+        } else {
+          // Se não houver ninguém à espera, este cliente fica na fila.
+          console.log('[PAREAMENTO] Nenhum par encontrado. Cliente colocado na fila de espera.');
+          waitingPeer = ws;
+          ws.send(JSON.stringify({ type: 'waiting' }));
+        }
+        break;
+
+      // Para mensagens WebRTC (offer, answer, candidate), simplesmente reencaminha para o par.
+      case 'offer':
+      case 'answer':
+      case 'candidate':
+        if (ws.peer) {
+          console.log(`[SINALIZAÇÃO] Reencaminhando '${data.type}' para o par.`);
+          ws.peer.send(JSON.stringify(data));
+        } else {
+          console.warn(`[AVISO] Mensagem '${data.type}' recebida, mas o cliente não tem um par.`);
+        }
+        break;
+
+      default:
+        console.warn(`[AVISO] Tipo de mensagem desconhecido: ${data.type}`);
     }
+  });
 
-    // Lida com mensagens recebidas do cliente
-    ws.on('message', message => {
-        try {
-            const data = JSON.parse(message);
-            console.log(`Mensagem de ${ws.id}:`, data.type);
+  // Lógica de tratamento de desconexão.
+  ws.on('close', () => {
+    console.log('[CONEXÃO] Cliente desconectado.');
+    
+    // Se o cliente que se desconectou era o que estava à espera.
+    if (waitingPeer === ws) {
+      waitingPeer = null;
+      console.log('[PAREAMENTO] Cliente que estava na fila desconectou-se.');
+    }
+    
+    // Se o cliente estava numa chamada, notifica o outro.
+    if (ws.peer) {
+      console.log('[CONEXÃO] Notificando o par sobre a desconexão.');
+      ws.peer.send(JSON.stringify({ type: 'call_ended' }));
+      ws.peer.peer = null; // Limpa a referência do par.
+    }
+  });
 
-            switch (data.type) {
-                case 'request_new_peer':
-                    console.log(`Cliente ${ws.id} solicitou novo peer.`);
-                    // Desconecta do peer atual (se existir)
-                    if (ws.peer) {
-                        if (ws.peer.readyState === WebSocket.OPEN) {
-                            ws.peer.send(JSON.stringify({ type: 'call_ended' }));
-                            ws.peer.peer = null; // Desassocia o peer do cliente restante
-                        }
-                        ws.peer = null; // Remove o peer deste cliente
-                    }
-                    
-                    // Tenta encontrar um novo par para este cliente
-                    if (!findAndPairPeer(ws)) {
-                        console.log(`Cliente ${ws.id} agora aguardando por um novo par.`);
-                        ws.send(JSON.stringify({ type: 'waiting' }));
-                    }
-                    break;
-                case 'report_user':
-                    console.warn(`DENÚNCIA RECEBIDA: Cliente ${ws.id} denunciou cliente ${data.reportedPeerId || 'desconhecido'}. Motivo: ${data.reason || 'Não especificado'}`);
-                    // Em um app real, aqui você faria:
-                    // 1. Salvar no banco de dados
-                    // 2. Notificar moderadores
-                    // 3. Potencialmente desconectar os usuários ou banir
-                    if (ws.peer && ws.peer.readyState === WebSocket.OPEN) {
-                        ws.peer.send(JSON.stringify({ type: 'report_received' }));
-                    }
-                    break;
-                default: // Mensagens WebRTC comuns (offer, answer, candidate)
-                    if (ws.peer && ws.peer.readyState === WebSocket.OPEN) {
-                        ws.peer.send(JSON.stringify(data));
-                    } else {
-                        console.log(`Peer de ${ws.id} não está conectado ou pronto. Mensagem "${data.type}" não entregue.`);
-                    }
-                    break;
-            }
-        } catch (err) {
-            console.error(`Erro ao processar mensagem JSON de ${ws.id}:`, err);
-        }
-    });
-
-    // Lida com a desconexão do cliente
-    ws.on('close', () => {
-        console.log(`Cliente ${ws.id} desconectado.`);
-        clients.delete(ws.id);
-
-        if (ws.peer && ws.peer.readyState === WebSocket.OPEN) {
-             ws.peer.send(JSON.stringify({ type: 'call_ended' }));
-             ws.peer.peer = null;
-             console.log(`Peer de ${ws.id} (${ws.peer.id}) notificado sobre desconexão.`);
-        }
-        console.log(`Total de clientes restantes: ${clients.size}`);
-    });
-
-    // Lida com erros na conexão WebSocket
-    ws.on('error', error => {
-        console.error(`Erro no cliente ${ws.id}:`, error);
-    });
+  ws.on('error', (error) => {
+    console.error('[ERRO] Erro no WebSocket:', error);
+  });
 });
 
-// Inicia o servidor HTTP e o faz escutar na porta
-server.listen(PORT, () => {
-    // Este console.log já está coberto pelo wss.on('listening'), mas é redundante e seguro.
-});
+// Inicia o servidor.
+server.listen(PORT);
